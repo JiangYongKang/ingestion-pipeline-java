@@ -37,3 +37,7 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### Ingestion runtime data ###
+/data/
+*.log
+nohup.out

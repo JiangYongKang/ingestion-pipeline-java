@@ -1,0 +1,29 @@
+package com.github.highcumontoa.ingestionpipelinejava.model;
+
+/**
+ * 拒绝/失败原因码。不同前缀代表不同类别，保证原因可区分：
+ * AUTH_* 鉴权类、PARAM_* 参数类、SOURCE_* 来源配置类、
+ * OFFSET_* 位点类、BACKLOG_* 积压类、BATCH_* 批量类、
+ * SCHEMA_* 结构演进类、DATA_* 单条数据类、CONFLICT 冲突类。
+ */
+public enum ErrorCode {
+    AUTH_MISSING_CREDENTIALS,
+    AUTH_INVALID_CREDENTIALS,
+    AUTH_FORBIDDEN,
+    PARAM_INVALID,
+    SOURCE_NOT_FOUND,
+    SOURCE_TYPE_UNKNOWN,
+    SOURCE_CONFIG_INVALID,
+    SOURCE_DISABLED,
+    OFFSET_FALLBACK,
+    OFFSET_NON_MONOTONIC,
+    OFFSET_VERSION_STALE,
+    BACKLOG_LIMIT_REACHED,
+    BATCH_TOO_LARGE,
+    SCHEMA_MISSING_FIELD,
+    SCHEMA_TYPE_MISMATCH,
+    SCHEMA_REMOVED_COLUMN,
+    SCHEMA_EVOLUTION_INVALID,
+    DATA_INVALID,
+    CONFLICT
+}
