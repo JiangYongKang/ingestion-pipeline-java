@@ -37,3 +37,10 @@ build/
 
 ### Mac OS ###
 .DS_Store
+### 本地运行时状态目录 ###
+data/
+target/test-data/
+
+# 保留示例文件拉取目录（其运行时内容仍被忽略）
+!data/sample-file-source/
+!data/sample-file-source/.gitkeep
