@@ -15,8 +15,8 @@ import org.springframework.stereotype.Component;
 public class RateLimiter {
 
     private static final class Bucket {
-        final int maxInflight;
-        final int ratePerSec;
+        int maxInflight;
+        int ratePerSec;
         int inflight;
         double tokens;
         long lastRefillNanos;
@@ -31,10 +31,24 @@ public class RateLimiter {
 
     private final ConcurrentMap<String, Bucket> buckets = new ConcurrentHashMap<>();
 
+    /** 注册来源（幂等：已存在则保留运行状态，不重置在途计数与令牌）。 */
     public void register(String source, int maxInflight, int ratePerSec) {
-        buckets.compute(source, (k, old) -> old == null
-                ? new Bucket(maxInflight, ratePerSec)
-                : new Bucket(maxInflight, ratePerSec));
+        buckets.computeIfAbsent(source, k -> new Bucket(maxInflight, ratePerSec));
+    }
+
+    /**
+     * 运行期热更新配额：只影响此后的获取；已在途的计数保留。
+     * 令牌按新容量重新装满 —— 新配额对此后的流量立即完整生效
+     * （与初始注册时的满桶语义一致，可复现）。
+     */
+    public void reconfigure(String source, int maxInflight, int ratePerSec) {
+        Bucket b = buckets.computeIfAbsent(source, k -> new Bucket(maxInflight, ratePerSec));
+        synchronized (b) {
+            b.maxInflight = maxInflight;
+            b.ratePerSec = ratePerSec;
+            b.tokens = Math.max(ratePerSec, 0);
+            b.lastRefillNanos = System.nanoTime();
+        }
     }
 
     /** 获取一个在途许可，满则 false（由调用方归为 BACKLOG_FULL）。 */

@@ -74,6 +74,8 @@ GET  /mock/sources/{source}/records?after=0&limit=100 (X-API-Key)
 | GET  | `/api/admin/sources/{src}/dlq` | 失败记录（原始数据+错误+归类+次数+状态） |
 | POST | `/api/admin/sources/{src}/dlq/retry` | 按策略重试一轮，返回 resolved/stillFailed/exhausted |
 | POST | `/api/admin/sources/{src}/schema` | 声明/演进结构 |
+| GET  | `/api/admin/sources/{src}/capacity` | 容量治理视图：生效配额 + 总容量使用 + 分原因拒绝计数 |
+| PUT  | `/api/admin/sources/{src}/quota` | 热调整配额（rateLimitPerSec/maxInflight/batchSize，缺省字段保持原值） |
 
 ## 3. 幂等、冲突与失败隔离规则
 
@@ -127,7 +129,8 @@ GET  /mock/sources/{source}/records?after=0&limit=100 (X-API-Key)
 | 配置不完整 | `INCOMPLETE_CONFIG` | 400 |
 | JSON 不可解析 | `MALFORMED_BODY` | 400 |
 | 缺 batchId / 批次超限 | `MISSING_BATCH_ID(400)` / `BATCH_TOO_LARGE(413)` | |
-| 在途积压满 / 超令牌桶 | `BACKLOG_FULL / RATE_LIMITED` | 429 |
+| 在途积压满 / 超令牌桶 / 总容量到顶 | `BACKLOG_FULL / RATE_LIMITED / GLOBAL_CAPACITY_EXCEEDED` | 429 |
+| 非法配额热调整 | `INVALID_QUOTA` | 400 |
 
 鉴权类（401/403）与参数类（400）、冲突类（409）、数据类（422）、积压类（429）状态码与 reason 码都不同，调用方可明确区分。
 
@@ -139,6 +142,39 @@ GET  /mock/sources/{source}/records?after=0&limit=100 (X-API-Key)
 - 内存有界：读取按 `batch-size` 分页；限速/积压状态每来源仅一个计数器+令牌桶；JSONL 逐行流式读取。
 - `max-attempts`：单条记录总尝试次数（含首次）。坏数据不会无限重投：达到上限标记 `EXHAUSTED`，后续 retry 不再投递它；修复后成功则 `RESOLVED`。
 
+## 7.1 进程级容量治理（运行期）
+
+在每来源保护之上，还有一份**全进程共享的总容量**，推送与拉取从同一份许可中取用，任何来源都无法绕过：
+
+- `ingestion.global-max-inflight`：全进程在途处理许可总数（默认 10000）。推送批次在处理期间占 1 个许可，拉取每轮占 1 个许可，`try/finally` 成对释放。
+- **总容量到顶即明确拒绝**：推送返回 `GLOBAL_CAPACITY_EXCEEDED(429)`；拉取该轮放弃并等下一轮。绝不无限排队，也不会撑爆内存。
+- **公平分配是确定、可复现的**：每个来源可持有的全局许可上限 = `max(1, floor(总容量 / 来源数))`。各来源份额之和不超过总容量，因此一个来源即使长期占满自己的份额，其它来源也一定能拿到属于自己的那一份——不存在饿死，也不依赖时序运气。
+- **与既有按来源保护的关系**：总容量检查在每来源检查**之前**；两者独立生效、互不改写。一次请求可能先被总容量拦（`GLOBAL_CAPACITY_EXCEEDED`），也可能过了总容量但被自身配额拦（`BACKLOG_FULL` / `RATE_LIMITED`），原因始终可区分。
+
+### 配额热调整（不重启进程）
+
+```
+PUT /api/admin/sources/{src}/quota   (X-API-Key)
+{"rateLimitPerSec": 200, "maxInflight": 50, "batchSize": 20}   // 字段缺省 = 保持当前值
+```
+
+- 新配额**只对此后的处理生效**：已在途/已接收的数据不受影响，不丢失、不重复、位点不错乱；速率调整时令牌桶按新容量装满，新配额立即完整生效。
+- 生效情况可查询：`GET /api/admin/sources/{src}/capacity` 返回当前生效配额与总容量使用。
+- 非法配额（速率为负、在途/批规模 < 1）整体拒绝：`INVALID_QUOTA(400)`，**当前生效配置保持不变**。
+
+### 拒绝可解释、计数不失真
+
+`GET /api/admin/sources/{src}/capacity` 的 `rejections` 段按来源分别给出：
+
+| 计数 | 含义 | 对应 reason |
+|------|------|------------|
+| `globalCapacityExceeded` | 被进程级总容量拦下 | `GLOBAL_CAPACITY_EXCEEDED(429)` |
+| `sourceBacklogFull` | 被该来源自身在途上限拦下 | `BACKLOG_FULL(429)` |
+| `sourceRateLimited` | 被该来源自身速率配额拦下 | `RATE_LIMITED(429)` |
+
+计数只在真实拦截处累加一次：整批重放在容量检查**之前**短路返回首次结果，不占用容量也不累计拒绝；被拒绝的批次不写入幂等结果库，容量恢复后重投可正常处理——统计与实际被拦次数一致，不丢数据也不重复写入。
+
+
 ## 8. 配置项（`application.properties`）
 
 | 配置 | 默认 | 说明 |
@@ -149,14 +185,15 @@ GET  /mock/sources/{source}/records?after=0&limit=100 (X-API-Key)
 | `ingestion.default-max-attempts` | 3 | 默认单条最大尝试次数 |
 | `ingestion.default-poll-interval-ms` | 500 | 默认拉取轮询间隔 |
 | `ingestion.pull.enabled` | true | 拉取调度总开关 |
+| `ingestion.global-max-inflight` | 10000 | 进程级总容量：所有来源合计在途许可上限 |
 | `ingestion.sources[i].name` | — | 来源名（唯一） |
 | `ingestion.sources[i].type` | — | `PUSH / PULL_FILE / PULL_HTTP` |
 | `ingestion.sources[i].token` | — | 凭据（必填） |
 | `ingestion.sources[i].dir` | — | PULL_FILE 必填：JSONL 目录 |
 | `ingestion.sources[i].url` | — | PULL_HTTP 必填：端点基址 |
-| `ingestion.sources[i].batch-size` | 默认 | 该来源批规模 |
-| `ingestion.sources[i].rate-limit-per-sec` | 0=不限 | 该来源每秒令牌数 |
-| `ingestion.sources[i].max-inflight` | 默认 | 该来源在途上限 |
+| `ingestion.sources[i].batch-size` | 默认 | 该来源批规模（运行期可热调整） |
+| `ingestion.sources[i].rate-limit-per-sec` | 0=不限 | 该来源每秒令牌数（运行期可热调整） |
+| `ingestion.sources[i].max-inflight` | 默认 | 该来源在途上限（运行期可热调整） |
 | `ingestion.sources[i].poll-interval-ms` | 默认 | 该来源轮询间隔 |
 | `ingestion.sources[i].max-attempts` | 默认 | 该来源单条最大尝试次数 |
 | `ingestion.sources[i].enabled` | true | 设为 false 跳过该来源装配 |
@@ -193,6 +230,15 @@ curl -s http://127.0.0.1:8080/api/admin/sources/inventory-file/offset \
 curl -s http://127.0.0.1:8080/api/admin/sources/orders-push/metrics -H 'X-API-Key: push-token-orders'
 curl -s http://127.0.0.1:8080/api/admin/sources/orders-push/dlq    -H 'X-API-Key: push-token-orders'
 curl -s -X POST http://127.0.0.1:8080/api/admin/sources/orders-push/dlq/retry -H 'X-API-Key: push-token-orders'
+
+# 6) 容量治理：查看生效配额/总容量/分原因拒绝计数；热调整配额（立即生效，无需重启）
+curl -s http://127.0.0.1:8080/api/admin/sources/orders-push/capacity -H 'X-API-Key: push-token-orders'
+curl -s -X PUT http://127.0.0.1:8080/api/admin/sources/orders-push/quota \
+  -H 'X-API-Key: push-token-orders' -H 'Content-Type: application/json' \
+  -d '{"rateLimitPerSec":5,"maxInflight":50,"batchSize":20}'
+# 再用同一凭据 GET capacity 确认新配额已生效；非法值（如 {"maxInflight":0}）返回 400 INVALID_QUOTA 且原配置不变
+# 复现总容量拒绝：把 ingestion.global-max-inflight 调小（如 =来源数）后重启，
+# 并发推送超过每来源份额的批次数，超出部分返回 429 GLOBAL_CAPACITY_EXCEEDED 且 capacity 接口计数同步增长
 ```
 
 ## 10. 测试
@@ -201,7 +247,7 @@ curl -s -X POST http://127.0.0.1:8080/api/admin/sources/orders-push/dlq/retry -H
 mvn test
 ```
 
-共 21 个用例（测试日志以 `SCENARIO` logger 打印每个场景的 **GIVEN 输入 / EXPECT / ACTUAL 判定 / BECAUSE 依据**）：
+共 26 个用例（测试日志以 `SCENARIO` logger 打印每个场景的 **GIVEN 输入 / EXPECT / ACTUAL 判定 / BECAUSE 依据**）：
 
 | 测试类 | 覆盖场景 |
 |--------|---------|
@@ -213,7 +259,8 @@ mvn test
 | `PullFileSourceTest` | 文件拉取位点推进、坏行进 DLQ 不中断、重启续读、有界分页、缺口冻结 |
 | `PullHttpSourceTest` | HTTP 携凭据连续拉取、位点提交、源端未授权 401 |
 | `ConcurrencyAndBacklogTest` | 12 线程并发写入每键一行无重复无丢失、积压满/限速原因可区分且零写入、批次超限 |
-| `WebEndToEndTest` | 真实 HTTP：401/403 零写入、声明+投递+重放、指标、DLQ 有界重试、最终状态一致 |
+| `CapacityGovernanceTest` | 同进程推送+拉取共用一份总容量、公平份额可复现不饿死、配额热调整即时生效且非法值被拒、拒绝零写入零位点变化、重放/重复投递不重复累计拒绝 |
+| `WebEndToEndTest` | 真实 HTTP：401/403 零写入、声明+投递+重放、指标、DLQ 有界重试、最终状态一致、配额热调整端点生效与非法拒绝 |
 | `ApplicationTests` | Spring 上下文装配冒烟 |
 
 ## 11. 落盘结构（可解释/可复现）

@@ -69,9 +69,12 @@ class PullFileSourceTest {
         OffsetStore offsets = new OffsetStore(props);
         MetricsStore metrics = new MetricsStore(props);
         RateLimiter rl = new RateLimiter();
+        var governor = new com.github.highcumontoa.ingestionpipelinejava.service.CapacityGovernor(props);
+        var quotas = new com.github.highcumontoa.ingestionpipelinejava.service.QuotaManager(registry, rl, governor);
         IngestionService svc = new IngestionService(registry, validator, schemas, sink,
-                batches, dlq, metrics, rl);
-        PullCoordinator coord = new PullCoordinator(registry, svc, offsets, dlq, rl, metrics, false);
+                batches, dlq, metrics, rl, governor, quotas);
+        PullCoordinator coord = new PullCoordinator(registry, svc, offsets, dlq, rl,
+                governor, quotas, metrics, false);
         return new Ctx(coord, offsets, sink, dlq, fileDir);
     }
 

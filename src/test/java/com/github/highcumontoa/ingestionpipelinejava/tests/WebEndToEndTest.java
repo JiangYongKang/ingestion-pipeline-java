@@ -193,4 +193,54 @@ class WebEndToEndTest {
         assertTrue(finalRecords.containsKey("w1") && finalRecords.containsKey("w2"));
         TestLog.because(scenario, "401/403 与业务拒绝可区分且零写入；坏数据隔离+有界重试；最终状态只含合法数据");
     }
+
+    @Test
+    void quotaEndpointsExposeAndHotUpdateEffectiveQuota() {
+        String scenario = "web-quota";
+        String src = "other";
+        String tok = "other-token";
+        String capacity = "/api/admin/sources/" + src + "/capacity";
+        String quota = "/api/admin/sources/" + src + "/quota";
+
+        // 1) 初始生效配额可查询（来自装配配置），拒绝计数为 0
+        var c0 = get(capacity, tok);
+        TestLog.given(scenario, "GET capacity for freshly assembled source");
+        TestLog.actual(scenario, "status=" + c0.getStatusCode() + " body=" + c0.getBody());
+        assertEquals(200, c0.getStatusCode().value());
+        Map<String, Object> q0 = (Map<String, Object>) c0.getBody().get("quota");
+        assertEquals(0, ((Number) q0.get("rateLimitPerSec")).intValue());
+        Map<String, Object> rej0 = (Map<String, Object>) c0.getBody().get("rejections");
+        assertEquals(0, ((Number) rej0.get("globalCapacityExceeded")).longValue());
+        assertNotNull(c0.getBody().get("global"));
+
+        // 2) 热调整：只改速率，其它字段保持
+        var put = rest.exchange(url(quota), HttpMethod.PUT,
+                new HttpEntity<>(Map.of("rateLimitPerSec", 7), headers(tok)), Map.class);
+        assertEquals(200, put.getStatusCode().value());
+        Map<String, Object> q1 = (Map<String, Object>) put.getBody().get("quota");
+        TestLog.actual(scenario, "after PUT rateLimitPerSec=7 -> " + q1);
+        assertEquals(7, ((Number) q1.get("rateLimitPerSec")).intValue());
+        assertEquals(q0.get("maxInflight"), q1.get("maxInflight"));
+        assertEquals(q0.get("batchSize"), q1.get("batchSize"));
+
+        // 3) 调整后的生效情况可查询
+        var c1 = get(capacity, tok);
+        Map<String, Object> q1q = (Map<String, Object>) c1.getBody().get("quota");
+        assertEquals(7, ((Number) q1q.get("rateLimitPerSec")).intValue());
+
+        // 4) 非法配额：400 INVALID_QUOTA，生效配置不变
+        var bad = rest.exchange(url(quota), HttpMethod.PUT,
+                new HttpEntity<>(Map.of("maxInflight", 0), headers(tok)), Map.class);
+        TestLog.actual(scenario, "invalid PUT status=" + bad.getStatusCode() + " body=" + bad.getBody());
+        assertEquals(400, bad.getStatusCode().value());
+        assertEquals("INVALID_QUOTA", bad.getBody().get("reason"));
+        var c2 = get(capacity, tok);
+        assertEquals(c1.getBody().get("quota"), c2.getBody().get("quota"), "非法调整后生效配置不变");
+
+        // 5) 无凭据调整：401，零副作用
+        var noCred = rest.exchange(url(quota), HttpMethod.PUT,
+                new HttpEntity<>(Map.of("rateLimitPerSec", 1), headers(null)), Map.class);
+        assertEquals(401, noCred.getStatusCode().value());
+        TestLog.because(scenario, "配额热调整经管理面生效并可查询；非法值与未授权请求均被拒绝且不改配置");
+    }
 }

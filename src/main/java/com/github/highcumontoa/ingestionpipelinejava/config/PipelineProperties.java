@@ -17,6 +17,8 @@ public class PipelineProperties {
     private int defaultMaxInflight = 1000;
     private int defaultMaxAttempts = 3;
     private long defaultPollIntervalMs = 500;
+    /** 进程级总容量：所有来源（推送+拉取）合计的在途处理许可上限 */
+    private int globalMaxInflight = 10000;
 
     public Path getStateDir() { return stateDir; }
     public void setStateDir(Path stateDir) { this.stateDir = stateDir; }
@@ -30,4 +32,6 @@ public class PipelineProperties {
     public void setDefaultMaxAttempts(int defaultMaxAttempts) { this.defaultMaxAttempts = defaultMaxAttempts; }
     public long getDefaultPollIntervalMs() { return defaultPollIntervalMs; }
     public void setDefaultPollIntervalMs(long defaultPollIntervalMs) { this.defaultPollIntervalMs = defaultPollIntervalMs; }
+    public int getGlobalMaxInflight() { return globalMaxInflight; }
+    public void setGlobalMaxInflight(int globalMaxInflight) { this.globalMaxInflight = globalMaxInflight; }
 }

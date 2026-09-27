@@ -45,6 +45,10 @@ class PullHttpSourceTest {
     com.github.highcumontoa.ingestionpipelinejava.store.SchemaStore schemas;
     @Autowired
     com.github.highcumontoa.ingestionpipelinejava.store.RecordSink sink;
+    @Autowired
+    com.github.highcumontoa.ingestionpipelinejava.service.CapacityGovernor governor;
+    @Autowired
+    com.github.highcumontoa.ingestionpipelinejava.service.QuotaManager quotas;
 
     private HttpHeaders headers(String token) {
         HttpHeaders h = new HttpHeaders();
@@ -81,7 +85,7 @@ class PullHttpSourceTest {
 
         // 直接驱动协调器一轮，但读取器指向本地 mock 端点
         var coordinator = new com.github.highcumontoa.ingestionpipelinejava.service.pull.PullCoordinator(
-                registry, ingestion, offsets, dlq, rateLimiter, metrics, false);
+                registry, ingestion, offsets, dlq, rateLimiter, governor, quotas, metrics, false);
         coordinator.registerReader(source,
                 new com.github.highcumontoa.ingestionpipelinejava.service.pull.HttpSourceReader(base, token));
 

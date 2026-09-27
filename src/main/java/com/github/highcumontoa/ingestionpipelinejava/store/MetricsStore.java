@@ -23,6 +23,12 @@ public class MetricsStore {
         public final AtomicLong conflict = new AtomicLong();
         public final AtomicLong quarantined = new AtomicLong();
         public final AtomicLong rejected = new AtomicLong();
+        /** 容量治理细分：被进程级总容量拦下 */
+        public final AtomicLong rejectedGlobal = new AtomicLong();
+        /** 容量治理细分：被该来源自身在途积压上限拦下 */
+        public final AtomicLong rejectedBacklog = new AtomicLong();
+        /** 容量治理细分：被该来源自身速率配额拦下 */
+        public final AtomicLong rejectedRate = new AtomicLong();
         public final AtomicLong retried = new AtomicLong();
         public final AtomicLong dlqPending = new AtomicLong();
         public final AtomicLong dlqExhausted = new AtomicLong();
@@ -52,6 +58,9 @@ public class MetricsStore {
                 apply(c.conflict, loaded.get("conflict"));
                 apply(c.quarantined, loaded.get("quarantined"));
                 apply(c.rejected, loaded.get("rejected"));
+                apply(c.rejectedGlobal, loaded.get("rejectedGlobal"));
+                apply(c.rejectedBacklog, loaded.get("rejectedBacklog"));
+                apply(c.rejectedRate, loaded.get("rejectedRate"));
                 apply(c.retried, loaded.get("retried"));
                 apply(c.dlqPending, loaded.get("dlqPending"));
                 apply(c.dlqExhausted, loaded.get("dlqExhausted"));
@@ -72,16 +81,19 @@ public class MetricsStore {
         MetricSnapshot s = new MetricSnapshot(source, c.received.get(), c.accepted.get(),
                 c.duplicate.get(), c.conflict.get(), c.quarantined.get(), c.rejected.get(),
                 c.retried.get(), c.dlqPending.get(), c.dlqExhausted.get(), offset, inflight);
-        JsonFiles.writeAtomically(file(source), Map.of(
-                "received", s.received(),
-                "accepted", s.accepted(),
-                "duplicate", s.duplicate(),
-                "conflict", s.conflict(),
-                "quarantined", s.quarantined(),
-                "rejected", s.rejected(),
-                "retried", s.retried(),
-                "dlqPending", s.dlqPending(),
-                "dlqExhausted", s.dlqExhausted()));
+        JsonFiles.writeAtomically(file(source), Map.ofEntries(
+                Map.entry("received", s.received()),
+                Map.entry("accepted", s.accepted()),
+                Map.entry("duplicate", s.duplicate()),
+                Map.entry("conflict", s.conflict()),
+                Map.entry("quarantined", s.quarantined()),
+                Map.entry("rejected", s.rejected()),
+                Map.entry("rejectedGlobal", c.rejectedGlobal.get()),
+                Map.entry("rejectedBacklog", c.rejectedBacklog.get()),
+                Map.entry("rejectedRate", c.rejectedRate.get()),
+                Map.entry("retried", s.retried()),
+                Map.entry("dlqPending", s.dlqPending()),
+                Map.entry("dlqExhausted", s.dlqExhausted())));
         return s;
     }
 

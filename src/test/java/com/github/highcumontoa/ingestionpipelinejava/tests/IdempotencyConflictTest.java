@@ -53,8 +53,11 @@ class IdempotencyConflictTest {
         MetricsStore metrics = new MetricsStore(props);
         RateLimiter rateLimiter = new RateLimiter();
         rateLimiter.register(SOURCE, 1000, 0);
+        var governor = new com.github.highcumontoa.ingestionpipelinejava.service.CapacityGovernor(props);
+        var quotas = new com.github.highcumontoa.ingestionpipelinejava.service.QuotaManager(
+                registry, rateLimiter, governor);
         IngestionService svc = new IngestionService(registry, validator, schemas, sink,
-                batches, dlq, metrics, rateLimiter);
+                batches, dlq, metrics, rateLimiter, governor, quotas);
         return new Harness(svc, sink, metrics);
     }
 

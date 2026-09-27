@@ -3,7 +3,9 @@ package com.github.highcumontoa.ingestionpipelinejava.web;
 import com.github.highcumontoa.ingestionpipelinejava.model.DeadLetter;
 import com.github.highcumontoa.ingestionpipelinejava.model.MetricSnapshot;
 import com.github.highcumontoa.ingestionpipelinejava.service.AuthService;
+import com.github.highcumontoa.ingestionpipelinejava.service.CapacityGovernor;
 import com.github.highcumontoa.ingestionpipelinejava.service.IngestionService;
+import com.github.highcumontoa.ingestionpipelinejava.service.QuotaManager;
 import com.github.highcumontoa.ingestionpipelinejava.service.RateLimiter;
 import com.github.highcumontoa.ingestionpipelinejava.service.SourceDefinition;
 import com.github.highcumontoa.ingestionpipelinejava.store.DeadLetterStore;
@@ -17,6 +19,7 @@ import java.util.Map;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -37,10 +40,13 @@ public class AdminController {
     private final RecordSink sink;
     private final SchemaStore schemas;
     private final IngestionService ingestion;
+    private final QuotaManager quotas;
+    private final CapacityGovernor governor;
 
     public AdminController(AuthService auth, MetricsStore metrics, OffsetStore offsets,
                            RateLimiter rateLimiter, DeadLetterStore dlq, RecordSink sink,
-                           SchemaStore schemas, IngestionService ingestion) {
+                           SchemaStore schemas, IngestionService ingestion,
+                           QuotaManager quotas, CapacityGovernor governor) {
         this.auth = auth;
         this.metrics = metrics;
         this.offsets = offsets;
@@ -49,6 +55,8 @@ public class AdminController {
         this.sink = sink;
         this.schemas = schemas;
         this.ingestion = ingestion;
+        this.quotas = quotas;
+        this.governor = governor;
     }
 
     /** 仅返回凭据归属来源的指标（来源隔离）。 */
@@ -116,5 +124,58 @@ public class AdminController {
         view.put("committedOffset", offsets.current(source));
         view.put("records", sink.all(source));
         return view;
+    }
+
+    /**
+     * 容量治理视图：当前生效配额、进程级总容量使用、
+     * 以及按原因细分的拒绝计数（总容量 / 自身积压 / 自身限速）。
+     */
+    @GetMapping("/sources/{source}/capacity")
+    public Map<String, Object> capacity(@PathVariable String source,
+                                        @RequestHeader(value = "X-API-Key", required = false) String apiKey) {
+        auth.requireAccess(source, apiKey);
+        QuotaManager.Quota q = quotas.effective(source);
+        MetricsStore.Counters c = metrics.forSource(source);
+        Map<String, Object> view = new LinkedHashMap<>();
+        view.put("source", source);
+        view.put("quota", Map.of(
+                "rateLimitPerSec", q.rateLimitPerSec(),
+                "maxInflight", q.maxInflight(),
+                "batchSize", q.batchSize()));
+        view.put("global", Map.of(
+                "totalPermits", governor.totalPermits(),
+                "totalHeld", governor.totalHeld(),
+                "sourceCount", governor.sourceCount(),
+                "fairSharePerSource", governor.fairShare(),
+                "heldByThisSource", governor.held(source)));
+        view.put("rejections", Map.of(
+                "globalCapacityExceeded", c.rejectedGlobal.get(),
+                "sourceBacklogFull", c.rejectedBacklog.get(),
+                "sourceRateLimited", c.rejectedRate.get()));
+        return view;
+    }
+
+    /**
+     * 热调整配额（不重启进程）：只对此后的处理生效；
+     * 非法配额整体拒绝（INVALID_QUOTA 400），当前生效配置不变。
+     */
+    @PutMapping("/sources/{source}/quota")
+    public Map<String, Object> updateQuota(@PathVariable String source,
+                                           @RequestHeader(value = "X-API-Key", required = false) String apiKey,
+                                           @RequestBody QuotaUpdateRequest req) {
+        auth.requireAccess(source, apiKey);
+        QuotaManager.Quota q = quotas.update(source,
+                req == null ? null : req.rateLimitPerSec(),
+                req == null ? null : req.maxInflight(),
+                req == null ? null : req.batchSize());
+        return Map.of("source", source,
+                "quota", Map.of(
+                        "rateLimitPerSec", q.rateLimitPerSec(),
+                        "maxInflight", q.maxInflight(),
+                        "batchSize", q.batchSize()));
+    }
+
+    /** 配额热调整请求体；字段缺省表示保持当前值。 */
+    public record QuotaUpdateRequest(Integer rateLimitPerSec, Integer maxInflight, Integer batchSize) {
     }
 }

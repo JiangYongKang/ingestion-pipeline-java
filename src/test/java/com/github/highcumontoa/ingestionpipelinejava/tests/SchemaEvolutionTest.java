@@ -56,8 +56,10 @@ class SchemaEvolutionTest {
         MetricsStore metrics = new MetricsStore(props);
         RateLimiter rl = new RateLimiter();
         rl.register(SOURCE, 1000, 0);
+        var governor = new com.github.highcumontoa.ingestionpipelinejava.service.CapacityGovernor(props);
+        var quotas = new com.github.highcumontoa.ingestionpipelinejava.service.QuotaManager(registry, rl, governor);
         IngestionService svc = new IngestionService(registry, validator, schemas, sink,
-                batches, dlq, metrics, rl);
+                batches, dlq, metrics, rl, governor, quotas);
         return new Harness(svc, validator, schemas, sink, dlq);
     }
 

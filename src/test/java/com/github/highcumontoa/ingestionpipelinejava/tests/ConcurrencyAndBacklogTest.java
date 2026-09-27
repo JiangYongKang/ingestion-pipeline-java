@@ -65,8 +65,12 @@ class ConcurrencyAndBacklogTest {
         MetricsStore metrics = new MetricsStore(props);
         RateLimiter rl = new RateLimiter();
         rl.register(SOURCE, maxInflight, rate == null ? 0 : rate);
+        com.github.highcumontoa.ingestionpipelinejava.service.CapacityGovernor governor =
+                new com.github.highcumontoa.ingestionpipelinejava.service.CapacityGovernor(props);
+        com.github.highcumontoa.ingestionpipelinejava.service.QuotaManager quotas =
+                new com.github.highcumontoa.ingestionpipelinejava.service.QuotaManager(registry, rl, governor);
         IngestionService svc = new IngestionService(registry, validator, schemas, sink,
-                batches, dlq, metrics, rl);
+                batches, dlq, metrics, rl, governor, quotas);
         return new Harness(svc, sink, rl, metrics, registry, props);
     }
 

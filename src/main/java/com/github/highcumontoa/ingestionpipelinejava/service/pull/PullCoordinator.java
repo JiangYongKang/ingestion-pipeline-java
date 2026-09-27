@@ -5,7 +5,9 @@ import com.github.highcumontoa.ingestionpipelinejava.model.DeadLetter;
 import com.github.highcumontoa.ingestionpipelinejava.model.IngestionException;
 import com.github.highcumontoa.ingestionpipelinejava.model.IncomingRecord;
 import com.github.highcumontoa.ingestionpipelinejava.model.RejectReason;
+import com.github.highcumontoa.ingestionpipelinejava.service.CapacityGovernor;
 import com.github.highcumontoa.ingestionpipelinejava.service.IngestionService;
+import com.github.highcumontoa.ingestionpipelinejava.service.QuotaManager;
 import com.github.highcumontoa.ingestionpipelinejava.service.RateLimiter;
 import com.github.highcumontoa.ingestionpipelinejava.service.SourceDefinition;
 import com.github.highcumontoa.ingestionpipelinejava.service.SourceRegistry;
@@ -44,6 +46,8 @@ public class PullCoordinator {
     private final OffsetStore offsets;
     private final DeadLetterStore dlq;
     private final RateLimiter rateLimiter;
+    private final CapacityGovernor governor;
+    private final QuotaManager quotas;
     private final MetricsStore metrics;
     private final boolean enabled;
 
@@ -54,6 +58,7 @@ public class PullCoordinator {
 
     public PullCoordinator(SourceRegistry registry, IngestionService ingestion,
                            OffsetStore offsets, DeadLetterStore dlq, RateLimiter rateLimiter,
+                           CapacityGovernor governor, QuotaManager quotas,
                            MetricsStore metrics,
                            @Value("${ingestion.pull.enabled:true}") boolean enabled) {
         this.registry = registry;
@@ -61,6 +66,8 @@ public class PullCoordinator {
         this.offsets = offsets;
         this.dlq = dlq;
         this.rateLimiter = rateLimiter;
+        this.governor = governor;
+        this.quotas = quotas;
         this.metrics = metrics;
         this.enabled = enabled;
     }
@@ -75,7 +82,6 @@ public class PullCoordinator {
                     ? new FileSourceReader(d.dir())
                     : new HttpSourceReader(d.url(), d.token());
             readers.put(d.name(), reader);
-            rateLimiter.register(d.name(), d.maxInflight(), d.rateLimitPerSec());
             frozen.put(d.name(), Boolean.FALSE);
             running.put(d.name(), Boolean.FALSE);
         }
@@ -149,7 +155,17 @@ public class PullCoordinator {
                 log.warn("source '{}' is frozen (previous gap/unavailable); skip tick", source);
                 return 0;
             }
+            // 进程级总容量：与推送路径共用同一份许可，满则本轮明确放弃（可区分计数）
+            if (!governor.tryAcquire(source)) {
+                metrics.forSource(source).rejectedGlobal.incrementAndGet();
+                metrics.forSource(source).rejected.incrementAndGet();
+                log.warn("source '{}' skipped: process-wide capacity exhausted "
+                        + "(totalHeld={}/{})", source, governor.totalHeld(), governor.totalPermits());
+                return 0;
+            }
+            try {
             if (!rateLimiter.tryAcquireInflight(source)) {
+                metrics.forSource(source).rejectedBacklog.incrementAndGet();
                 log.warn("source '{}' backlog full; skip tick (bounded rejection)", source);
                 return 0;
             }
@@ -161,7 +177,7 @@ public class PullCoordinator {
                                 : new HttpSourceReader(def.url(), def.token()));
                 List<SourceReader.PulledRecord> batch;
                 try {
-                    batch = reader.read(current, def.batchSize());
+                    batch = reader.read(current, quotas.effective(source).batchSize());
                 } catch (IngestionException e) {
                     if (e.reason() == RejectReason.SOURCE_UNAVAILABLE) {
                         freeze(source, e.getMessage());
@@ -198,6 +214,9 @@ public class PullCoordinator {
                 return processed;
             } finally {
                 rateLimiter.releaseInflight(source);
+            }
+            } finally {
+                governor.release(source);
             }
         } finally {
             running.put(source, Boolean.FALSE);

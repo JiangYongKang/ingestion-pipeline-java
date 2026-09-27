@@ -39,10 +39,13 @@ public class IngestionService {
     private final DeadLetterStore dlq;
     private final MetricsStore metrics;
     private final RateLimiter rateLimiter;
+    private final CapacityGovernor governor;
+    private final QuotaManager quotas;
 
     public IngestionService(SourceRegistry registry, SchemaValidator schemaValidator,
                             SchemaStore schemas, RecordSink sink, BatchIdempotencyStore batches,
-                            DeadLetterStore dlq, MetricsStore metrics, RateLimiter rateLimiter) {
+                            DeadLetterStore dlq, MetricsStore metrics, RateLimiter rateLimiter,
+                            CapacityGovernor governor, QuotaManager quotas) {
         this.registry = registry;
         this.schemaValidator = schemaValidator;
         this.schemas = schemas;
@@ -51,6 +54,8 @@ public class IngestionService {
         this.dlq = dlq;
         this.metrics = metrics;
         this.rateLimiter = rateLimiter;
+        this.governor = governor;
+        this.quotas = quotas;
     }
 
     /** 推送式批次接入（已鉴权）。 */
@@ -63,11 +68,12 @@ public class IngestionService {
             throw bad(source, RejectReason.MISSING_BATCH_ID, "'batchId' is required for idempotent delivery");
         }
         int size = batch.records().size();
-        if (size > def.batchSize()) {
+        int batchSizeLimit = quotas.effective(source).batchSize();
+        if (size > batchSizeLimit) {
             throw bad(source, RejectReason.BATCH_TOO_LARGE,
-                    "batch size " + size + " exceeds configured batch-size " + def.batchSize());
+                    "batch size " + size + " exceeds configured batch-size " + batchSizeLimit);
         }
-        // 整批重放：直接返回首次结果，不重复写入
+        // 整批重放：直接返回首次结果，不重复写入、不占用容量、不重复累计任何计数
         BatchResult replay = batches.get(source, batch.batchId());
         if (replay != null) {
             log.info("batch replay source={} batchId={} -> return first result", source, batch.batchId());
@@ -76,18 +82,31 @@ public class IngestionService {
                     replay.conflict(), replay.quarantined(), replay.records());
         }
 
-        if (!rateLimiter.tryAcquireInflight(source)) {
-            throw bad(source, RejectReason.BACKLOG_FULL,
-                    "source '" + source + "' inflight backlog is full (" + def.maxInflight()
-                            + "); reject according to policy");
+        // 进程级总容量：任何来源都先过这一关，满则明确拒绝（可区分原因）
+        if (!governor.tryAcquire(source)) {
+            metrics.forSource(source).rejectedGlobal.incrementAndGet();
+            throw bad(source, RejectReason.GLOBAL_CAPACITY_EXCEEDED,
+                    "process-wide capacity exhausted (total=" + governor.totalPermits()
+                            + ", fairShare=" + governor.fairShare() + " for " + governor.sourceCount()
+                            + " sources); reject according to policy");
         }
         try {
-            metrics.forSource(source).received.addAndGet(size);
-            if (!rateLimiter.tryAcquireToken(source, size)) {
-                throw bad(source, RejectReason.RATE_LIMITED,
-                        "source '" + source + "' rate limit " + def.rateLimitPerSec()
-                                + " records/s exceeded");
+            if (!rateLimiter.tryAcquireInflight(source)) {
+                metrics.forSource(source).rejectedBacklog.incrementAndGet();
+                throw bad(source, RejectReason.BACKLOG_FULL,
+                        "source '" + source + "' inflight backlog is full ("
+                                + quotas.effective(source).maxInflight()
+                                + "); reject according to policy");
             }
+            try {
+                metrics.forSource(source).received.addAndGet(size);
+                if (!rateLimiter.tryAcquireToken(source, size)) {
+                    metrics.forSource(source).rejectedRate.incrementAndGet();
+                    throw bad(source, RejectReason.RATE_LIMITED,
+                            "source '" + source + "' rate limit "
+                                    + quotas.effective(source).rateLimitPerSec()
+                                    + " records/s exceeded");
+                }
 
             int schemaVersion;
             if (batch.schema() != null) {
@@ -120,8 +139,11 @@ public class IngestionService {
             log.info("batch done source={} batchId={} accepted={} duplicate={} conflict={} quarantined={}",
                     source, batch.batchId(), accepted, duplicate, conflict, quarantined);
             return result;
+            } finally {
+                rateLimiter.releaseInflight(source);
+            }
         } finally {
-            rateLimiter.releaseInflight(source);
+            governor.release(source);
         }
     }
 
