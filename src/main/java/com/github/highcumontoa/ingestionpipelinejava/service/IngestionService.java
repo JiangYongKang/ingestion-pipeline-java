@@ -39,10 +39,25 @@ public class IngestionService {
     private final DeadLetterStore dlq;
     private final MetricsStore metrics;
     private final RateLimiter rateLimiter;
+    private final QuotaService quotaService;
+    private final CapacityGovernor capacity;
 
+    /**
+     * 兼容构造（既有单测直接装配）：不启用进程级总容量，配额取注册表静态定义。
+     * 生产装配走下方 @Autowired 构造。
+     */
     public IngestionService(SourceRegistry registry, SchemaValidator schemaValidator,
                             SchemaStore schemas, RecordSink sink, BatchIdempotencyStore batches,
                             DeadLetterStore dlq, MetricsStore metrics, RateLimiter rateLimiter) {
+        this(registry, schemaValidator, schemas, sink, batches, dlq, metrics, rateLimiter,
+                new QuotaService(registry, rateLimiter), new CapacityGovernor(0, 1));
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired
+    public IngestionService(SourceRegistry registry, SchemaValidator schemaValidator,
+                            SchemaStore schemas, RecordSink sink, BatchIdempotencyStore batches,
+                            DeadLetterStore dlq, MetricsStore metrics, RateLimiter rateLimiter,
+                            QuotaService quotaService, CapacityGovernor capacity) {
         this.registry = registry;
         this.schemaValidator = schemaValidator;
         this.schemas = schemas;
@@ -51,6 +66,8 @@ public class IngestionService {
         this.dlq = dlq;
         this.metrics = metrics;
         this.rateLimiter = rateLimiter;
+        this.quotaService = quotaService;
+        this.capacity = capacity;
     }
 
     /** 推送式批次接入（已鉴权）。 */
@@ -63,11 +80,12 @@ public class IngestionService {
             throw bad(source, RejectReason.MISSING_BATCH_ID, "'batchId' is required for idempotent delivery");
         }
         int size = batch.records().size();
-        if (size > def.batchSize()) {
+        QuotaService.Quota quota = quotaService.effective(source);
+        if (size > quota.batchSize()) {
             throw bad(source, RejectReason.BATCH_TOO_LARGE,
-                    "batch size " + size + " exceeds configured batch-size " + def.batchSize());
+                    "batch size " + size + " exceeds configured batch-size " + quota.batchSize());
         }
-        // 整批重放：直接返回首次结果，不重复写入
+        // 整批重放：直接返回首次结果，不重复写入，也不占用/重复累计任何容量计数
         BatchResult replay = batches.get(source, batch.batchId());
         if (replay != null) {
             log.info("batch replay source={} batchId={} -> return first result", source, batch.batchId());
@@ -76,18 +94,25 @@ public class IngestionService {
                     replay.conflict(), replay.quarantined(), replay.records());
         }
 
-        if (!rateLimiter.tryAcquireInflight(source)) {
-            throw bad(source, RejectReason.BACKLOG_FULL,
-                    "source '" + source + "' inflight backlog is full (" + def.maxInflight()
-                            + "); reject according to policy");
+        // 进程级总容量：任何来源都不得绕过；到顶即明确拒绝，不排队
+        if (!capacity.tryAcquire(source)) {
+            throw bad(source, RejectReason.GLOBAL_CAPACITY_EXHAUSTED,
+                    "process-wide capacity exhausted (total in-flight limit reached for source '"
+                            + source + "' fair share or global pool); reject according to policy");
         }
         try {
-            metrics.forSource(source).received.addAndGet(size);
-            if (!rateLimiter.tryAcquireToken(source, size)) {
-                throw bad(source, RejectReason.RATE_LIMITED,
-                        "source '" + source + "' rate limit " + def.rateLimitPerSec()
-                                + " records/s exceeded");
+            if (!rateLimiter.tryAcquireInflight(source)) {
+                throw bad(source, RejectReason.BACKLOG_FULL,
+                        "source '" + source + "' inflight backlog is full (" + quota.maxInflight()
+                                + "); reject according to policy");
             }
+            try {
+                metrics.forSource(source).received.addAndGet(size);
+                if (!rateLimiter.tryAcquireToken(source, size)) {
+                    throw bad(source, RejectReason.RATE_LIMITED,
+                            "source '" + source + "' rate limit " + quota.rateLimitPerSec()
+                                    + " records/s exceeded");
+                }
 
             int schemaVersion;
             if (batch.schema() != null) {
@@ -119,9 +144,12 @@ public class IngestionService {
             batches.save(source, batch.batchId(), result);
             log.info("batch done source={} batchId={} accepted={} duplicate={} conflict={} quarantined={}",
                     source, batch.batchId(), accepted, duplicate, conflict, quarantined);
-            return result;
+                return result;
+            } finally {
+                rateLimiter.releaseInflight(source);
+            }
         } finally {
-            rateLimiter.releaseInflight(source);
+            capacity.release(source);
         }
     }
 
@@ -255,7 +283,15 @@ public class IngestionService {
     }
 
     private IngestionException bad(String source, RejectReason reason, String msg) {
-        metrics.forSource(source).rejected.incrementAndGet();
+        MetricsStore.Counters c = metrics.forSource(source);
+        c.rejected.incrementAndGet();
+        // 容量类拒绝按原因细分：自身限速 / 自身积压 / 进程级总容量，可区分、可查询
+        switch (reason) {
+            case RATE_LIMITED -> c.rejectedRateLimited.incrementAndGet();
+            case BACKLOG_FULL -> c.rejectedBacklogFull.incrementAndGet();
+            case GLOBAL_CAPACITY_EXHAUSTED -> c.rejectedGlobalCapacity.incrementAndGet();
+            default -> { }
+        }
         return new IngestionException(reason, msg);
     }
 }

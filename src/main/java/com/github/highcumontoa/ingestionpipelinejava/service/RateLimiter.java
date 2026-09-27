@@ -15,8 +15,8 @@ import org.springframework.stereotype.Component;
 public class RateLimiter {
 
     private static final class Bucket {
-        final int maxInflight;
-        final int ratePerSec;
+        int maxInflight;
+        int ratePerSec;
         int inflight;
         double tokens;
         long lastRefillNanos;
@@ -35,6 +35,21 @@ public class RateLimiter {
         buckets.compute(source, (k, old) -> old == null
                 ? new Bucket(maxInflight, ratePerSec)
                 : new Bucket(maxInflight, ratePerSec));
+    }
+
+    /**
+     * 运行期热更新配额：就地修改参数，保留当前在途计数（已在途的处理不受影响）。
+     * 令牌补到新配额的满桶：保证调大速率后新配额对此后请求立即生效，
+     * 调小时也最多只放行一个新满桶的突发，随后按新速率收敛。
+     */
+    public synchronized void updateQuota(String source, int maxInflight, int ratePerSec) {
+        Bucket b = buckets.computeIfAbsent(source, k -> new Bucket(maxInflight, ratePerSec));
+        synchronized (b) {
+            b.maxInflight = maxInflight;
+            b.ratePerSec = ratePerSec;
+            b.tokens = Math.max(ratePerSec, 0);
+            b.lastRefillNanos = System.nanoTime();
+        }
     }
 
     /** 获取一个在途许可，满则 false（由调用方归为 BACKLOG_FULL）。 */

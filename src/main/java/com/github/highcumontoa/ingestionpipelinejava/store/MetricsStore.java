@@ -26,6 +26,9 @@ public class MetricsStore {
         public final AtomicLong retried = new AtomicLong();
         public final AtomicLong dlqPending = new AtomicLong();
         public final AtomicLong dlqExhausted = new AtomicLong();
+        public final AtomicLong rejectedRateLimited = new AtomicLong();
+        public final AtomicLong rejectedBacklogFull = new AtomicLong();
+        public final AtomicLong rejectedGlobalCapacity = new AtomicLong();
     }
 
     private final Path root;
@@ -55,6 +58,9 @@ public class MetricsStore {
                 apply(c.retried, loaded.get("retried"));
                 apply(c.dlqPending, loaded.get("dlqPending"));
                 apply(c.dlqExhausted, loaded.get("dlqExhausted"));
+                apply(c.rejectedRateLimited, loaded.get("rejectedRateLimited"));
+                apply(c.rejectedBacklogFull, loaded.get("rejectedBacklogFull"));
+                apply(c.rejectedGlobalCapacity, loaded.get("rejectedGlobalCapacity"));
             }
             return c;
         });
@@ -71,17 +77,23 @@ public class MetricsStore {
         Counters c = forSource(source);
         MetricSnapshot s = new MetricSnapshot(source, c.received.get(), c.accepted.get(),
                 c.duplicate.get(), c.conflict.get(), c.quarantined.get(), c.rejected.get(),
-                c.retried.get(), c.dlqPending.get(), c.dlqExhausted.get(), offset, inflight);
-        JsonFiles.writeAtomically(file(source), Map.of(
-                "received", s.received(),
-                "accepted", s.accepted(),
-                "duplicate", s.duplicate(),
-                "conflict", s.conflict(),
-                "quarantined", s.quarantined(),
-                "rejected", s.rejected(),
-                "retried", s.retried(),
-                "dlqPending", s.dlqPending(),
-                "dlqExhausted", s.dlqExhausted()));
+                c.retried.get(), c.dlqPending.get(), c.dlqExhausted.get(), offset, inflight,
+                c.rejectedRateLimited.get(), c.rejectedBacklogFull.get(),
+                c.rejectedGlobalCapacity.get());
+        Map<String, Long> persisted = new java.util.LinkedHashMap<>();
+        persisted.put("received", s.received());
+        persisted.put("accepted", s.accepted());
+        persisted.put("duplicate", s.duplicate());
+        persisted.put("conflict", s.conflict());
+        persisted.put("quarantined", s.quarantined());
+        persisted.put("rejected", s.rejected());
+        persisted.put("retried", s.retried());
+        persisted.put("dlqPending", s.dlqPending());
+        persisted.put("dlqExhausted", s.dlqExhausted());
+        persisted.put("rejectedRateLimited", s.rejectedRateLimited());
+        persisted.put("rejectedBacklogFull", s.rejectedBacklogFull());
+        persisted.put("rejectedGlobalCapacity", s.rejectedGlobalCapacity());
+        JsonFiles.writeAtomically(file(source), persisted);
         return s;
     }
 
@@ -89,7 +101,9 @@ public class MetricsStore {
         Counters c = forSource(source);
         return new MetricSnapshot(source, c.received.get(), c.accepted.get(),
                 c.duplicate.get(), c.conflict.get(), c.quarantined.get(), c.rejected.get(),
-                c.retried.get(), c.dlqPending.get(), c.dlqExhausted.get(), offset, inflight);
+                c.retried.get(), c.dlqPending.get(), c.dlqExhausted.get(), offset, inflight,
+                c.rejectedRateLimited.get(), c.rejectedBacklogFull.get(),
+                c.rejectedGlobalCapacity.get());
     }
 
     /** 以 DLQ 当前真实状态为准同步两个存量计数，避免增量增减漂移。 */

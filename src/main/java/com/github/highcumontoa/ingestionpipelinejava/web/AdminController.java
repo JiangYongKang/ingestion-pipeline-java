@@ -17,6 +17,7 @@ import java.util.Map;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestHeader;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -37,10 +38,14 @@ public class AdminController {
     private final RecordSink sink;
     private final SchemaStore schemas;
     private final IngestionService ingestion;
+    private final com.github.highcumontoa.ingestionpipelinejava.service.QuotaService quotaService;
+    private final com.github.highcumontoa.ingestionpipelinejava.service.CapacityGovernor capacity;
 
     public AdminController(AuthService auth, MetricsStore metrics, OffsetStore offsets,
                            RateLimiter rateLimiter, DeadLetterStore dlq, RecordSink sink,
-                           SchemaStore schemas, IngestionService ingestion) {
+                           SchemaStore schemas, IngestionService ingestion,
+                           com.github.highcumontoa.ingestionpipelinejava.service.QuotaService quotaService,
+                           com.github.highcumontoa.ingestionpipelinejava.service.CapacityGovernor capacity) {
         this.auth = auth;
         this.metrics = metrics;
         this.offsets = offsets;
@@ -49,6 +54,8 @@ public class AdminController {
         this.sink = sink;
         this.schemas = schemas;
         this.ingestion = ingestion;
+        this.quotaService = quotaService;
+        this.capacity = capacity;
     }
 
     /** 仅返回凭据归属来源的指标（来源隔离）。 */
@@ -116,5 +123,50 @@ public class AdminController {
         view.put("committedOffset", offsets.current(source));
         view.put("records", sink.all(source));
         return view;
+    }
+
+    /** 查询某来源当前生效配额（热调整前后的对比依据）。 */
+    @GetMapping("/sources/{source}/quota")
+    public Map<String, Object> quota(@PathVariable String source,
+                                     @RequestHeader(value = "X-API-Key", required = false) String apiKey) {
+        auth.requireAccess(source, apiKey);
+        var q = quotaService.effective(source);
+        Map<String, Object> view = new LinkedHashMap<>();
+        view.put("source", source);
+        view.put("batchSize", q.batchSize());
+        view.put("rateLimitPerSec", q.rateLimitPerSec());
+        view.put("maxInflight", q.maxInflight());
+        return view;
+    }
+
+    /**
+     * 不重启热调整配额：新配额只对此后的处理生效；
+     * 非法值 -> INVALID_QUOTA(400)，当前生效配置不变。
+     */
+    @PutMapping("/sources/{source}/quota")
+    public Map<String, Object> updateQuota(@PathVariable String source,
+                                           @RequestHeader(value = "X-API-Key", required = false) String apiKey,
+                                           @RequestBody(required = false) com.github.highcumontoa.ingestionpipelinejava.web.dto.QuotaUpdateRequest req) {
+        auth.requireAccess(source, apiKey);
+        if (req == null) {
+            throw new com.github.highcumontoa.ingestionpipelinejava.model.IngestionException(
+                    com.github.highcumontoa.ingestionpipelinejava.model.RejectReason.INVALID_QUOTA,
+                    "request body must contain quota fields; current quota unchanged");
+        }
+        var q = quotaService.update(source, req.batchSize(), req.rateLimitPerSec(), req.maxInflight());
+        Map<String, Object> view = new LinkedHashMap<>();
+        view.put("source", source);
+        view.put("batchSize", q.batchSize());
+        view.put("rateLimitPerSec", q.rateLimitPerSec());
+        view.put("maxInflight", q.maxInflight());
+        return view;
+    }
+
+    /** 进程级总容量快照：总量/已用/公平份额/各来源占用（任何有效凭据可查）。 */
+    @GetMapping("/capacity")
+    public com.github.highcumontoa.ingestionpipelinejava.service.CapacityGovernor.CapacitySnapshot capacity(
+            @RequestHeader(value = "X-API-Key", required = false) String apiKey) {
+        auth.requireAnyValid(apiKey);
+        return capacity.snapshot();
     }
 }
