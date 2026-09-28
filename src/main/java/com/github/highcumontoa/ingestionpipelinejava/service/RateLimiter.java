@@ -31,10 +31,12 @@ public class RateLimiter {
 
     private final ConcurrentMap<String, Bucket> buckets = new ConcurrentHashMap<>();
 
+    /**
+     * 启动期注册某来源的在途/限速桶。幂等：来源已注册（如已被配额服务播种、
+     * 或已做过运行期热调整）时保留既有桶与运行期状态，绝不把生效配置重置回静态值。
+     */
     public void register(String source, int maxInflight, int ratePerSec) {
-        buckets.compute(source, (k, old) -> old == null
-                ? new Bucket(maxInflight, ratePerSec)
-                : new Bucket(maxInflight, ratePerSec));
+        buckets.computeIfAbsent(source, k -> new Bucket(maxInflight, ratePerSec));
     }
 
     /**

@@ -37,14 +37,24 @@ public class QuotaService {
         this.rateLimiter = rateLimiter;
         for (SourceDefinition d : registry.all()) {
             quotas.put(d.name(), new Quota(d.batchSize(), d.rateLimitPerSec(), d.maxInflight()));
+            // 启动即播种限速/在途桶：推送与拉取来源在进程启动后、任何运行期调整之前，
+            // 都必须立即遵守配置的每秒速率与在途上限，不存在"调整一次后才生效"的窗口。
+            // register 幂等：拉取调度器的 @PostConstruct 再注册一次也不会重置桶。
+            rateLimiter.register(d.name(), d.maxInflight(), d.rateLimitPerSec());
         }
     }
 
     /** 查询某来源当前生效配额。 */
     public Quota effective(String source) {
         SourceDefinition def = registry.require(source);
-        return quotas.computeIfAbsent(def.name(),
-                k -> new Quota(def.batchSize(), def.rateLimitPerSec(), def.maxInflight()));
+        Quota q = quotas.get(def.name());
+        if (q == null) {
+            // 兜底（正常路径构造器已播种全部来源）：同样立即播种限速桶，不留无保护窗口
+            q = new Quota(def.batchSize(), def.rateLimitPerSec(), def.maxInflight());
+            quotas.put(def.name(), q);
+            rateLimiter.register(def.name(), def.maxInflight(), def.rateLimitPerSec());
+        }
+        return q;
     }
 
     /**

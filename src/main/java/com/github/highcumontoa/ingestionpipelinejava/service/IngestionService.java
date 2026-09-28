@@ -94,56 +94,59 @@ public class IngestionService {
                     replay.conflict(), replay.quarantined(), replay.records());
         }
 
-        // 进程级总容量：任何来源都不得绕过；到顶即明确拒绝，不排队
+        // 进程级总容量：任何来源都不得绕过；到顶即明确拒绝，不排队。
+        // 拒绝发生在任何 received 计数之前：被拒请求零写入、零位点、零接收计数。
         if (!capacity.tryAcquire(source)) {
             throw bad(source, RejectReason.GLOBAL_CAPACITY_EXHAUSTED,
                     "process-wide capacity exhausted (total in-flight limit reached for source '"
                             + source + "' fair share or global pool); reject according to policy");
         }
         try {
-            if (!rateLimiter.tryAcquireInflight(source)) {
+            boolean acquired = rateLimiter.tryAcquireInflight(source);
+            if (!acquired) {
                 throw bad(source, RejectReason.BACKLOG_FULL,
                         "source '" + source + "' inflight backlog is full (" + quota.maxInflight()
                                 + "); reject according to policy");
             }
             try {
-                metrics.forSource(source).received.addAndGet(size);
                 if (!rateLimiter.tryAcquireToken(source, size)) {
                     throw bad(source, RejectReason.RATE_LIMITED,
                             "source '" + source + "' rate limit " + quota.rateLimitPerSec()
                                     + " records/s exceeded");
                 }
+                // 通过全部容量/在途/限速门限后才计为已接收；此前任何拒绝都不产生接收计数
+                metrics.forSource(source).received.addAndGet(size);
 
-            int schemaVersion;
-            if (batch.schema() != null) {
-                schemaVersion = schemaValidator.declare(source, batch.schema());
-            } else {
-                RecordSchema latest = schemas.latest(source);
-                if (latest == null) {
-                    throw bad(source, RejectReason.SCHEMA_VERSION_INVALID,
-                            "source '" + source + "' has no schema; first batch must declare one");
+                int schemaVersion;
+                if (batch.schema() != null) {
+                    schemaVersion = schemaValidator.declare(source, batch.schema());
+                } else {
+                    RecordSchema latest = schemas.latest(source);
+                    if (latest == null) {
+                        throw bad(source, RejectReason.SCHEMA_VERSION_INVALID,
+                                "source '" + source + "' has no schema; first batch must declare one");
+                    }
+                    schemaVersion = latest.version();
                 }
-                schemaVersion = latest.version();
-            }
 
-            List<RecordResult> results = new ArrayList<>(size);
-            int accepted = 0, duplicate = 0, conflict = 0, quarantined = 0;
-            MetricsStore.Counters mc = metrics.forSource(source);
-            for (IncomingRecord r : batch.records()) {
-                RecordResult rr = handleOne(source, null, r, schemaVersion, def.maxAttempts(), 1);
-                results.add(rr);
-                switch (rr.status()) {
-                    case ACCEPTED -> { accepted++; mc.accepted.incrementAndGet(); }
-                    case DUPLICATE -> { duplicate++; mc.duplicate.incrementAndGet(); }
-                    case CONFLICT -> { conflict++; mc.conflict.incrementAndGet(); }
-                    case QUARANTINED -> { quarantined++; }
+                List<RecordResult> results = new ArrayList<>(size);
+                int accepted = 0, duplicate = 0, conflict = 0, quarantined = 0;
+                MetricsStore.Counters mc = metrics.forSource(source);
+                for (IncomingRecord r : batch.records()) {
+                    RecordResult rr = handleOne(source, null, r, schemaVersion, def.maxAttempts(), 1);
+                    results.add(rr);
+                    switch (rr.status()) {
+                        case ACCEPTED -> { accepted++; mc.accepted.incrementAndGet(); }
+                        case DUPLICATE -> { duplicate++; mc.duplicate.incrementAndGet(); }
+                        case CONFLICT -> { conflict++; mc.conflict.incrementAndGet(); }
+                        case QUARANTINED -> { quarantined++; }
+                    }
                 }
-            }
-            BatchResult result = new BatchResult(batch.batchId(), false, accepted, duplicate,
-                    conflict, quarantined, results);
-            batches.save(source, batch.batchId(), result);
-            log.info("batch done source={} batchId={} accepted={} duplicate={} conflict={} quarantined={}",
-                    source, batch.batchId(), accepted, duplicate, conflict, quarantined);
+                BatchResult result = new BatchResult(batch.batchId(), false, accepted, duplicate,
+                        conflict, quarantined, results);
+                batches.save(source, batch.batchId(), result);
+                log.info("batch done source={} batchId={} accepted={} duplicate={} conflict={} quarantined={}",
+                        source, batch.batchId(), accepted, duplicate, conflict, quarantined);
                 return result;
             } finally {
                 rateLimiter.releaseInflight(source);
