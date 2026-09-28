@@ -93,7 +93,8 @@ public class PullCoordinator {
                     ? new FileSourceReader(d.dir())
                     : new HttpSourceReader(d.url(), d.token());
             readers.put(d.name(), reader);
-            rateLimiter.register(d.name(), d.maxInflight(), d.rateLimitPerSec());
+            // 限速/在途桶由 QuotaService 在启动时对所有来源（推送+拉取）统一播种，
+            // 拉取调度不再自行注册，避免只覆盖拉取来源的启动期缺口。
             frozen.put(d.name(), Boolean.FALSE);
             running.put(d.name(), Boolean.FALSE);
         }

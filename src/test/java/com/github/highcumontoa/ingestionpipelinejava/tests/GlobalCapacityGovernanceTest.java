@@ -52,6 +52,53 @@ class GlobalCapacityGovernanceTest {
                            QuotaService quotas, CapacityGovernor governor, Path fileDir) {
     }
 
+    /**
+     * 与 {@link #harness} 相同，但<b>不手工 register 限速桶</b>：
+     * 完全依赖 QuotaService 构造时按启动配置播种（等价生产装配路径），
+     * 用以证明推送来源的速率/在途保护在启动后、零调整时即生效。
+     */
+    private Harness productionSeededHarness(Path tmp, int total, int pushRate, int pullBatchSize)
+            throws Exception {
+        Path fileDir = tmp.resolve("filedir");
+        Files.createDirectories(fileDir);
+        PipelineProperties props = new PipelineProperties();
+        props.setStateDir(tmp.resolve("state"));
+        SourceConfig push = new SourceConfig();
+        push.setName(PUSH);
+        push.setType("PUSH");
+        push.setToken("t1");
+        push.setBatchSize(100);
+        push.setRateLimitPerSec(pushRate);
+        push.setMaxInflight(1000);
+        SourceConfig pull = new SourceConfig();
+        pull.setName(PULL);
+        pull.setType("PULL_FILE");
+        pull.setToken("t2");
+        pull.setDir(fileDir.toString());
+        pull.setBatchSize(pullBatchSize);
+        pull.setPollIntervalMs(60_000L);
+        props.setSources(List.of(push, pull));
+
+        SourceRegistry registry = new SourceRegistry(props);
+        SchemaStore schemas = new SchemaStore(props);
+        SchemaValidator validator = new SchemaValidator(schemas);
+        RecordSink sink = new RecordSink(props);
+        var batches = new BatchIdempotencyStore(props);
+        DeadLetterStore dlq = new DeadLetterStore(props);
+        OffsetStore offsets = new OffsetStore(props);
+        MetricsStore metrics = new MetricsStore(props);
+        RateLimiter rl = new RateLimiter();
+        QuotaService quotas = new QuotaService(registry, rl); // 启动播种全部来源
+        CapacityGovernor governor = new CapacityGovernor(total, 2);
+        IngestionService svc = new IngestionService(registry, validator, schemas, sink,
+                batches, dlq, metrics, rl, quotas, governor);
+        PullCoordinator coord = new PullCoordinator(registry, svc, offsets, dlq, rl, metrics,
+                quotas, governor, false);
+        schemas.register(PULL, new RecordSchema(1, List.of(
+                new SchemaField("id", SchemaField.FieldType.STRING, true))));
+        return new Harness(svc, coord, sink, offsets, metrics, rl, quotas, governor, fileDir);
+    }
+
     /** 同一进程装配一个推送源 + 一个文件拉取源，共享总量为 total 的全局容量池。 */
     private Harness harness(Path tmp, int total, int pushRate, int pullBatchSize) throws Exception {
         Path fileDir = tmp.resolve("filedir");
@@ -257,5 +304,38 @@ class GlobalCapacityGovernanceTest {
         assertEquals(3, s2.rejected());
         assertEquals(1, h.sink.all(PUSH).size(), "重放不产生重复写入");
         TestLog.because(scenario, "批次幂等检查在容量扣减之前：重放直接返回首次结果，统计不失真");
+    }
+
+    @Test
+    void pushAndPullBothLimitedAtStartupWithoutAnyQuotaAdjustment(@TempDir Path tmp) throws Exception {
+        String scenario = "startup-protection-shared-capacity";
+        // 生产式播种（无手工 register），total=2，推送启动速率 1/s、拉取单批 10；全程零热调整
+        Harness h = productionSeededHarness(tmp, 2, 1, 10);
+        h.svc.ingestBatch(PUSH, new RecordBatch("init", pushSchema(), List.of()));
+        writePullLines(h.fileDir, 1, 2);
+        TestLog.given(scenario, "fresh process, never PUT quota; push rate=1/s, push+pull share total=2");
+
+        // 1) 两类来源的桶在启动后即就位（不依赖首次热调整）
+        assertTrue(h.rl.isRegistered(PUSH), "推送来源启动即有限速/积压桶");
+        assertTrue(h.rl.isRegistered(PULL), "拉取来源启动即有限速/积压桶");
+
+        // 2) 拉取先占用全局池的一份份额并正常推进（推送/拉取共用同一总池）
+        assertEquals(2, h.pull.tick(PULL), "启动配置的拉取单批规模立即生效，数据正常写入");
+        assertEquals(2, h.offsets.current(PULL), "拉取位点连续推进");
+        assertEquals(2, h.sink.all(PULL).size());
+
+        // 3) 推送首批消费唯一令牌；紧随的突发批次立即被启动速率上限拦截（零调整）
+        h.svc.ingestBatch(PUSH, new RecordBatch("r1", null, List.of(rec("a"))));
+        IngestionException limited = assertThrows(IngestionException.class,
+                () -> h.svc.ingestBatch(PUSH, new RecordBatch("r2", null, List.of(rec("b")))));
+        TestLog.actual(scenario + "-push", limited.reason().toString());
+        assertEquals(RejectReason.RATE_LIMITED, limited.reason(),
+                "推送来源在进程启动后、未做任何调整时也必须遵守自身速率边界");
+        assertEquals(1, h.sink.all(PUSH).size(), "被拒推送批次零写入");
+        MetricSnapshot pushSnap = snap(h, PUSH);
+        assertEquals(1, pushSnap.rejectedRateLimited());
+        assertEquals(1, pushSnap.rejected());
+        TestLog.because(scenario, "QuotaService 启动时为推送+拉取统一播种：按来源保护与总容量保护"
+                + "从第一个请求起同时生效，来源类型不同也不能绕过任何一层");
     }
 }

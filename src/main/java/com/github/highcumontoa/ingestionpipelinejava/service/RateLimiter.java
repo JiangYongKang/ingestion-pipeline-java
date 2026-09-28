@@ -31,10 +31,18 @@ public class RateLimiter {
 
     private final ConcurrentMap<String, Bucket> buckets = new ConcurrentHashMap<>();
 
+    /**
+     * 按启动配置播种来源桶；幂等：桶已存在（例如 QuotaService 启动播种先于拉取调度）时
+     * 保留在途计数与令牌，绝不重置生效中的运行期状态。需要强制应用新配额请走
+     * {@link #updateQuota(String, int, int)}。
+     */
     public void register(String source, int maxInflight, int ratePerSec) {
-        buckets.compute(source, (k, old) -> old == null
-                ? new Bucket(maxInflight, ratePerSec)
-                : new Bucket(maxInflight, ratePerSec));
+        buckets.computeIfAbsent(source, k -> new Bucket(maxInflight, ratePerSec));
+    }
+
+    /** 来源是否已有生效中的限速/积压桶（启动保护是否就位的可观测依据）。 */
+    public boolean isRegistered(String source) {
+        return buckets.containsKey(source);
     }
 
     /**

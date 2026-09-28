@@ -137,6 +137,8 @@ GET  /mock/sources/{source}/records?after=0&limit=100 (X-API-Key)
 
 ## 7. 有界积压、限速与重试策略
 
+> 生效时机：下列按来源限制（速率 / 在途 / 单批规模）对**推送与拉取来源在进程启动后立即生效**——`QuotaService` 构造时即用启动配置为所有来源播种限速/积压桶，无需先做一次运行期调整；运行期热调整只改变此后的请求。
+
 - `max-inflight`：每来源在途批次上限，满则按策略拒绝（`BACKLOG_FULL`），绝不无限排队。
 - `rate-limit-per-sec`：每来源令牌桶（容量=每秒配额，按时间补充）；拉取途中令牌耗尽则本轮结束等下次（`RATE_LIMITED`）。
 - `batch-size`：单批记录上限，超限整批拒绝（无部分写入）。
@@ -150,16 +152,33 @@ GET  /mock/sources/{source}/records?after=0&limit=100 (X-API-Key)
 - **同一份总池**：每次推送批次 / 每轮拉取处理前，先从全局池取 1 个在途许可（与按来源 `max-inflight` 同维度），处理结束（含异常）必释放。全局占用到顶后，新到处理**立即明确拒绝** `GLOBAL_CAPACITY_EXHAUSTED`(429)，不无限排队、不撑爆内存；任何来源都无法绕过。
 - **公平分配（确定、可复现）**：每来源静态公平份额 `share = max(1, global-max-inflight / 来源数)`（启动时按注册来源数确定）。任何来源在全局池中的占用不得超过其份额；因为 `来源数 × share <= 总量`，份额之和不超过总量，所以**某个来源即使长期占满自己的份额，也挤不占其它来源的份额**——每个来源在任何时刻都保证拿得到自己的份额。
 - **与按来源保护的兼容关系**：总容量是**额外一层**，不改变既有按来源语义。一次推送批次的判定顺序为：批次幂等（重放直接返回，不占容量不计数）→ 总容量 → 按来源在途（`BACKLOG_FULL`）→ 按来源限速（`RATE_LIMITED`）→ 结构/写入。拉取每轮同理（总容量 → 在途 → 逐条令牌）。
+- **推送与拉取完全对等，启动即生效**：`QuotaService` 在进程启动（Spring 单例构造）时，按 `application.properties` 的启动配置为**所有注册来源（PUSH / PULL_FILE / PULL_HTTP）统一播种**生效配额与限速/在途桶；`RateLimiter.register` 幂等（桶已存在则保留在途计数与令牌，绝不重置）。因此：
+  - 进程刚启动、**尚未做任何运行期配额调整**时，推送来源与拉取来源一样立即遵守各自的 `rate-limit-per-sec` / `max-inflight` / `batch-size`，连续突发批次不会被直接接收；
+  - 不存在"只有拉取来源受限、推送来源要等首次热调整才建桶"的按来源类型差异（这正是本版修复的启动期穿透缺口：此前推送桶只在首次 `PUT quota` 时才创建，无桶期间 `RateLimiter` 按"不限"放行）；
+  - 任何一层（按来源速率 / 按来源在途 / 进程总容量）到边界，请求都被**明确拒绝**，原因码与细分指标互不相同；被拒请求不产生数据写入、不提交位点、不落批次结果，因此重试表现为一次新的真实拦截（计数随真实拦截次数累加），而**成功批次的整批重放**在容量扣减之前被识别并直接返回首次结果，拒绝计数不重复累加。
 - **拒绝可解释**：指标中 `rejectedGlobalCapacity` / `rejectedBacklogFull` / `rejectedRateLimited` 三个细分计数分别对应"被总容量拦 / 被自身积压拦 / 被自身限速拦"，按来源可查（`GET /api/admin/sources/{src}/metrics`），且**计数与实际被拦次数一致**——整批重放在容量扣减之前被识别并直接返回首次结果，不会重复累加；全局快照（总量/已用/公平份额/各来源占用）见 `GET /api/admin/capacity`。
 
-### 7.2 配额热调整（不重启）
+### 7.2 配额热调整（不重启）与生效时机
 
-`PUT /api/admin/sources/{src}/quota` 可在运行期调整单来源的 `batchSize` / `rateLimitPerSec` / `maxInflight`（未给出的字段保持不变）：
+`PUT /api/admin/sources/{src}/quota` 可在运行期调整单来源的 `batchSize` / `rateLimitPerSec` / `maxInflight`（未给出的字段保持不变）。生效时机有明确边界：
 
-- 新配额**只对此后的处理生效**：已接收或正在处理的数据不受影响，不丢失、不重复、位点不错乱（在途计数保留；令牌补到新配额满桶，保证调大速率后立即生效）。
+- **启动配置就是第一份生效配额**：进程启动后、首次调整之前，所有来源（含推送）一律按 `application.properties` 的静态值受限，不存在无保护的启动窗口。
+- **调整只对此后的请求生效**：已接收或正在处理的数据不受影响，不丢失、不重复、位点不错乱（在途计数保留；令牌补到新配额满桶，保证调大速率后立即生效；并发突发下各计数器/令牌桶均为同步原子扣减，不出现短时穿透）。
 - 调整前后的生效配额可通过 `GET /api/admin/sources/{src}/quota` 查询对比。
-- 非法配额（`batchSize<=0`、`rateLimitPerSec<0`、`maxInflight<=0`）整体拒绝 `INVALID_QUOTA`(400)，**当前生效配置保持不变**。
+- 非法配额（`batchSize<=0`、`rateLimitPerSec<0`、`maxInflight<=0`）整体拒绝 `INVALID_QUOTA`(400)，**当前生效配置保持不变**（先校验后写入，非法路径不触碰任何生效状态）。
 - 重启后生效配置回到 `application.properties` 的静态值（热调整不落盘）。
+
+### 7.3 容量/限速拒绝原因定义
+
+| 触发边界 | reason | HTTP | 细分计数 | 副作用 |
+|----------|--------|------|----------|--------|
+| 单批记录数 > `batch-size` | `BATCH_TOO_LARGE` | 413 | 计入 `rejected` | 整批拒绝，无写入/无位点 |
+| 来源自身令牌桶不足（超 `rate-limit-per-sec`） | `RATE_LIMITED` | 429 | `rejectedRateLimited` | 无写入/无位点/不落批次结果 |
+| 来源自身在途数达 `max-inflight` | `BACKLOG_FULL` | 429 | `rejectedBacklogFull` | 无写入/无位点/不落批次结果 |
+| 进程总在途到顶或超出本来源公平份额 | `GLOBAL_CAPACITY_EXHAUSTED` | 429 | `rejectedGlobalCapacity` | 无写入/无位点（拉取本轮放弃，数据留源端） |
+| 非法热调整取值 | `INVALID_QUOTA` | 400 | 不计入容量类拒绝 | 生效配置不变 |
+
+判定顺序（推送）：批次幂等 → 总容量 → 来源在途 → 来源速率 → 结构/写入；拉取每轮：总容量 → 来源在途 → 逐条令牌。因此同一请求只命中最外层那一个原因，三类容量拒绝原因稳定可区分。
 
 ## 8. 配置项（`application.properties`）
 
@@ -228,6 +247,20 @@ curl -s -X PUT http://127.0.0.1:8080/api/admin/sources/orders-push/quota \
 
 # 7) 进程级总容量快照（总量/已用/公平份额/各来源占用）
 curl -s http://127.0.0.1:8080/api/admin/capacity -H 'X-API-Key: push-token-orders'
+
+# 8) 启动期推送保护复现（关键：全新启动后不要先 PUT quota）
+#    orders-push 启动配置 rate-limit-per-sec=50、max-inflight=200。
+#    进程刚启动、未做任何运行期调整时，连续突发超过 50 条/s 的批次必须立即收到
+#    429 RATE_LIMITED，而不是被直接接收；重启进程后行为一致（热调整不落盘）。
+for i in $(seq 1 6); do
+  curl -s -o /dev/null -w "burst #$i -> %{http_code}\n" \
+    -X POST http://127.0.0.1:8080/api/sources/orders-push/ingest \
+    -H 'X-API-Key: push-token-orders' -H 'Content-Type: application/json' \
+    -d "{\"batchId\":\"startup-burst-$i-$RANDOM\",\"records\":[$(seq -s, 1 20 | sed 's/[0-9]*/{"key":"k'$i'-&","data":{"id":"x"}}/g')]}"
+done
+# 预期：前若干批 200（令牌桶容量内），桶耗尽后立即 429 {"reason":"RATE_LIMITED",...}；
+#   GET metrics 中 rejectedRateLimited 与实际被拦次数一致，data 中无被拒批次的部分写入。
+curl -s http://127.0.0.1:8080/api/admin/sources/orders-push/metrics -H 'X-API-Key: push-token-orders'
 ```
 
 ## 10. 测试
@@ -236,7 +269,7 @@ curl -s http://127.0.0.1:8080/api/admin/capacity -H 'X-API-Key: push-token-order
 mvn test
 ```
 
-共 27 个用例（测试日志以 `SCENARIO` logger 打印每个场景的 **GIVEN 输入 / EXPECT / ACTUAL 判定 / BECAUSE 依据**）：
+共 33 个用例（测试日志以 `SCENARIO` logger 打印每个场景的 **GIVEN 输入 / EXPECT / ACTUAL 判定 / BECAUSE 依据**）：
 
 | 测试类 | 覆盖场景 |
 |--------|---------|
@@ -248,7 +281,9 @@ mvn test
 | `PullFileSourceTest` | 文件拉取位点推进、坏行进 DLQ 不中断、重启续读、有界分页、缺口冻结 |
 | `PullHttpSourceTest` | HTTP 携凭据连续拉取、位点提交、源端未授权 401 |
 | `ConcurrencyAndBacklogTest` | 12 线程并发写入每键一行无重复无丢失、积压满/限速原因可区分且零写入、批次超限 |
-| `GlobalCapacityGovernanceTest` | 同进程推送+拉取共享同一总容量池、公平份额防止挤占、配额热调整立即生效且非法值被拒、拒绝零写入零位点变更、重放不累加拒绝计数 |
+| `GlobalCapacityGovernanceTest` | 同进程推送+拉取共享同一总容量池、公平份额防止挤占、配额热调整立即生效且非法值被拒、拒绝零写入零位点变更、重放不累加拒绝计数、**启动零调整时推送+拉取均立即受限** |
+| `PushStartupProtectionTest` | **进程启动后未做任何调整：推送速率突发边界（12 线程并发无穿透）、在途边界、单批规模立即生效；被拒批次重投按真实拦截计数、成功批次重放不重复计数** |
+| `StartupProtectionWiringTest` | **真实 Spring 装配：上下文启动后推送/拉取桶均已按启动配置就位，推送速率边界在首次请求即生效（防"仅测试手工 register 才生效"回归）** |
 | `AdminQuotaEndpointTest` | 管理端点：配额查询/热调整/非法拒绝/跨来源 403、总容量快照观测与鉴权 |
 | `WebEndToEndTest` | 真实 HTTP：401/403 零写入、声明+投递+重放、指标、DLQ 有界重试、最终状态一致 |
 | `ApplicationTests` | Spring 上下文装配冒烟 |
